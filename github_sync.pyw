@@ -144,6 +144,7 @@ def local_info(path, do_fetch):
         elif line.startswith("# branch.ab "):
             a, b = line[12:].split()
             info["ahead"], info["behind"] = int(a), -int(b)
+            info["upstream_exists"] = True
         elif line and not line.startswith("#"):
             info["changes"] += 1
     if not info.get("no_commits"):
@@ -151,6 +152,30 @@ def local_info(path, do_fetch):
         if "\x1f" in out:
             info["last_commit_date"], info["last_commit_msg"] = out.split("\x1f", 1)
     return info
+
+
+def clear_stale_locks(path, min_age_minutes=10):
+    """Remove *.lock files left behind in .git by a crashed/killed git (e.g. PC shut down mid-operation).
+    Only removes locks older than min_age_minutes, and only when no git.exe is running."""
+    git_dir = Path(path) / ".git"
+    if not git_dir.is_dir():
+        return []
+    cutoff = datetime.now().timestamp() - min_age_minutes * 60
+    locks = [p for p in git_dir.rglob("*.lock") if p.is_file() and p.stat().st_mtime < cutoff]
+    if not locks:
+        return []
+    if os.name == "nt":
+        _, out, _ = run(["tasklist", "/FI", "IMAGENAME eq git.exe", "/NH"])
+        if "git.exe" in out.lower():
+            return []
+    removed = []
+    for p in locks:
+        try:
+            p.unlink()
+            removed.append(str(p.relative_to(git_dir)))
+        except OSError:
+            pass
+    return removed
 
 
 def fetch_github_repos():
@@ -206,6 +231,8 @@ def compute_status(row):
         return "Detached HEAD (not on a branch)", "error"
     if not info.get("upstream"):
         return f"Branch '{info.get('branch')}' not on GitHub yet  →  Push", "ahead"
+    if not info.get("upstream_exists"):
+        return f"Branch '{info.get('branch')}' was deleted on GitHub (switch branch in your editor)", "error"
     a, b, c = info["ahead"], info["behind"], info["changes"]
     dirty = f"  ·  {c} uncommitted" if c else ""
     if a and b:
@@ -758,8 +785,15 @@ class App(tk.Tk):
                       "Describe the change (commit message):",
             initialvalue=f"Update from {PC_NAME} {datetime.now():%Y-%m-%d %H:%M}", parent=self)
 
+    def _unlock(self, path):
+        removed = clear_stale_locks(path)
+        if removed:
+            self.ui(self.log_line, f"{Path(path).name}: removed leftover lock file(s) from an earlier "
+                                   f"interrupted git operation: {', '.join(removed)}")
+
     def _pull_one(self, loc, allow_rebase):
         p = loc["path"]
+        self._unlock(p)
         if not loc.get("upstream"):
             self.ui(self.log_line, f"{loc['name']}: branch is not on GitHub yet, nothing to pull.")
             return True
@@ -782,6 +816,7 @@ class App(tk.Tk):
 
     def _push_one(self, loc, message):
         p = loc["path"]
+        self._unlock(p)
         if loc.get("changes") or loc.get("no_commits"):
             ok, _ = self.git(["git", "add", "-A"], p)
             if ok and (loc.get("changes")):
@@ -845,6 +880,7 @@ class App(tk.Tk):
         def work():
             for iid, r in rows:
                 loc = r["local"]
+                self._unlock(loc["path"])
                 if loc.get("changes"):   # commit first so the pull can rebase cleanly
                     self.git(["git", "add", "-A"], loc["path"])
                     self.git(["git", "commit", "-m", msg or "Update"], loc["path"])
@@ -944,6 +980,7 @@ class App(tk.Tk):
 
         def work():
             p = str(path)
+            self._unlock(p)
             if not loc["is_git"]:
                 if not self.git(["git", "init", "-b", "main"], p)[0]:
                     return
