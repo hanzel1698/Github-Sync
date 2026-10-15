@@ -844,6 +844,31 @@ class App(tk.Tk):
                                f"added to .gitignore): {', '.join(dirs)}")
         return True
 
+    def _protect_caches(self, p):
+        """List the cache folders in .git/info/exclude (this PC only). Git may then overwrite this PC's
+        untracked copies during a pull, instead of refusing with "untracked working tree files would be
+        overwritten" while the commits being replayed still contain those files."""
+        rc, out, _ = run(["git", "rev-parse", "--git-path", "info/exclude"], cwd=p)
+        if rc or not out:
+            return
+        exclude = Path(p, out)
+        _, gradle, _ = run(["git", "ls-files", "-co", "--exclude-standard", "--",
+                            "*build.gradle", "*build.gradle.kts"], cwd=p)
+        wanted = [f"{d}/" for d in sorted(CACHE_DIRS)] + sorted(
+            {"/" + (f.rsplit("/", 1)[0] + "/" if "/" in f else "") + "build/" for f in gradle.splitlines()})
+        try:
+            text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            have = {ln.strip() for ln in text.splitlines()}
+            new = [ln for ln in wanted if ln not in have]
+            if new:
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                if text and not text.endswith("\n"):
+                    text += "\n"
+                exclude.write_text(text + "# Tool caches (added by GitHub Sync)\n" + "\n".join(new) + "\n",
+                                   encoding="utf-8")
+        except OSError:
+            pass
+
     def _revert_dirty_caches(self, p):
         """Before a pull: throw away this PC's edits to *tracked* cache files, so they can't block the pull."""
         _, out, _ = run(["git", "diff", "--name-only"], cwd=p)
@@ -875,6 +900,7 @@ class App(tk.Tk):
         if not loc.get("upstream"):
             self.ui(self.log_line, f"{loc['name']}: branch is not on GitHub yet, nothing to pull.")
             return True
+        self._protect_caches(p)
         self._revert_dirty_caches(p)
         if loc["ahead"] and loc["behind"]:
             if not allow_rebase:
@@ -885,10 +911,14 @@ class App(tk.Tk):
                 ok, conflicted = self._finish_rebase_over_caches(p)
             if not ok:
                 self.git(["git", "rebase", "--abort"], p)
-                files = ", ".join(conflicted[:8]) + (" …" if len(conflicted) > 8 else "")
-                self.ui(self.log_line, f"{loc['name']}: CONFLICT — the same files were changed on both PCs"
-                                       f"{': ' + files if files else ''}. Nothing was changed locally. "
-                                       "Resolve manually (e.g. in VS Code).", "err")
+                if conflicted:
+                    files = ", ".join(conflicted[:8]) + (" …" if len(conflicted) > 8 else "")
+                    self.ui(self.log_line, f"{loc['name']}: CONFLICT — the same files were changed on both "
+                                           f"PCs: {files}. Nothing was changed locally. "
+                                           "Resolve manually (e.g. in VS Code).", "err")
+                else:
+                    self.ui(self.log_line, f"{loc['name']}: pull failed (see the git message above). "
+                                           "Nothing was changed locally.", "err")
                 return False
         else:
             ok, out = self.git(["git", "pull", "--ff-only", "--autostash"], p)
