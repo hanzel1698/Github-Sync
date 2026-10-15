@@ -178,6 +178,31 @@ def clear_stale_locks(path, min_age_minutes=10):
     return removed
 
 
+# Folders that tools rebuild on every PC. Committing them makes both PCs change the same
+# (often binary) files on every build, which git can never merge.
+CACHE_DIRS = {".gradle", ".kotlin", ".cxx", ".dart_tool", "node_modules", "__pycache__",
+              ".pytest_cache", ".mypy_cache", ".vs"}
+
+
+def cache_dir_of(repo, relpath):
+    """'android/.gradle/x/y.bin' -> 'android/.gradle' if the path is inside a tool cache folder, else None.
+    A 'build' folder counts only when it sits next to a build.gradle(.kts) (Gradle build output)."""
+    parts = relpath.split("/")
+    for i, part in enumerate(parts[:-1]):
+        if part in CACHE_DIRS:
+            return "/".join(parts[:i + 1])
+        if part == "build":
+            parent = Path(repo, *parts[:i])
+            if (parent / "build.gradle").exists() or (parent / "build.gradle.kts").exists():
+                return "/".join(parts[:i + 1])
+    return None
+
+
+def gitignore_line(cache_dir):
+    name = cache_dir.rsplit("/", 1)[-1]
+    return f"{name}/" if name in CACHE_DIRS else f"/{cache_dir}/"
+
+
 def fetch_github_repos():
     rc, out, err = run(["gh", "repo", "list", "--limit", "1000", "--json",
                         "name,nameWithOwner,url,isPrivate,defaultBranchRef,pushedAt,"
@@ -791,21 +816,79 @@ class App(tk.Tk):
             self.ui(self.log_line, f"{Path(path).name}: removed leftover lock file(s) from an earlier "
                                    f"interrupted git operation: {', '.join(removed)}")
 
+    def _untrack_caches(self, p):
+        """Stop tracking tool cache folders (e.g. android/.gradle) and add them to .gitignore.
+        The files stay on disk. Returns True if anything changed (needs committing)."""
+        rc, out, _ = run(["git", "ls-files", "-co", "--exclude-standard"], cwd=p)
+        if rc:
+            return False
+        dirs = sorted({d for f in out.splitlines() if (d := cache_dir_of(p, f))})
+        if not dirs:
+            return False
+        gi = Path(p) / ".gitignore"
+        try:
+            text = gi.read_text(encoding="utf-8") if gi.exists() else ""
+            have = {ln.strip() for ln in text.splitlines()}
+            new = [ln for ln in dict.fromkeys(gitignore_line(d) for d in dirs) if ln not in have]
+            if new:
+                if text and not text.endswith("\n"):
+                    text += "\n"
+                gi.write_text(text + "# Tool caches, rebuilt on each PC (added by GitHub Sync)\n" +
+                              "\n".join(new) + "\n", encoding="utf-8")
+        except OSError as e:
+            self.ui(self.log_line, f"{Path(p).name}: could not update .gitignore: {e}", "err")
+            return False
+        self.git(["git", "rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--", *dirs], p)
+        self.git(["git", "add", ".gitignore"], p)
+        self.ui(self.log_line, f"{Path(p).name}: stopped uploading tool cache folders (kept on this PC, "
+                               f"added to .gitignore): {', '.join(dirs)}")
+        return True
+
+    def _revert_dirty_caches(self, p):
+        """Before a pull: throw away this PC's edits to *tracked* cache files, so they can't block the pull."""
+        _, out, _ = run(["git", "diff", "--name-only"], cwd=p)
+        dirty = [f for f in out.splitlines() if cache_dir_of(p, f)]
+        if dirty:
+            self.git(["git", "checkout", "--", *dirty], p, quiet=True)
+
+    def _finish_rebase_over_caches(self, p):
+        """A rebase stopped on conflicts. If every conflicted file is a tool cache file, resolve by no
+        longer tracking it (keeping this PC's copy on disk) and continue. Returns (ok, conflicted files)."""
+        for _ in range(500):
+            _, out, _ = run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=p)
+            conflicted = out.splitlines()
+            if not conflicted or any(not cache_dir_of(p, f) for f in conflicted):
+                return False, conflicted
+            self.ui(self.log_line, f"{Path(p).name}: {len(conflicted)} conflicting file(s) are only tool cache "
+                                   "files — dropping them from GitHub and keeping this PC's copy.")
+            for f in conflicted:
+                run(["git", "checkout", "--theirs", "--", f], cwd=p)   # in a rebase, 'theirs' = this PC
+            self.git(["git", "rm", "--cached", "--quiet", "--", *conflicted], p, quiet=True)
+            ok, _ = self.git(["git", "-c", "core.editor=true", "rebase", "--continue"], p)
+            if ok:
+                return True, []
+        return False, []
+
     def _pull_one(self, loc, allow_rebase):
         p = loc["path"]
         self._unlock(p)
         if not loc.get("upstream"):
             self.ui(self.log_line, f"{loc['name']}: branch is not on GitHub yet, nothing to pull.")
             return True
+        self._revert_dirty_caches(p)
         if loc["ahead"] and loc["behind"]:
             if not allow_rebase:
                 self.ui(self.log_line, f"{loc['name']}: diverged — use Sync to combine both sides.", "err")
                 return False
             ok, out = self.git(["git", "pull", "--rebase", "--autostash"], p)
             if not ok:
+                ok, conflicted = self._finish_rebase_over_caches(p)
+            if not ok:
                 self.git(["git", "rebase", "--abort"], p)
-                self.ui(self.log_line, f"{loc['name']}: CONFLICT — the same lines were changed on both PCs. "
-                                       "Nothing was changed locally. Resolve manually (e.g. in VS Code).", "err")
+                files = ", ".join(conflicted[:8]) + (" …" if len(conflicted) > 8 else "")
+                self.ui(self.log_line, f"{loc['name']}: CONFLICT — the same files were changed on both PCs"
+                                       f"{': ' + files if files else ''}. Nothing was changed locally. "
+                                       "Resolve manually (e.g. in VS Code).", "err")
                 return False
         else:
             ok, out = self.git(["git", "pull", "--ff-only", "--autostash"], p)
@@ -817,9 +900,10 @@ class App(tk.Tk):
     def _push_one(self, loc, message):
         p = loc["path"]
         self._unlock(p)
-        if loc.get("changes") or loc.get("no_commits"):
+        tidied = self._untrack_caches(p)
+        if loc.get("changes") or loc.get("no_commits") or tidied:
             ok, _ = self.git(["git", "add", "-A"], p)
-            if ok and (loc.get("changes")):
+            if ok and (loc.get("changes") or tidied):
                 ok, _ = self.git(["git", "commit", "-m", message], p)
             if not ok:
                 return False
@@ -881,7 +965,8 @@ class App(tk.Tk):
             for iid, r in rows:
                 loc = r["local"]
                 self._unlock(loc["path"])
-                if loc.get("changes"):   # commit first so the pull can rebase cleanly
+                tidied = self._untrack_caches(loc["path"])
+                if loc.get("changes") or tidied:   # commit first so the pull can rebase cleanly
                     self.git(["git", "add", "-A"], loc["path"])
                     self.git(["git", "commit", "-m", msg or "Update"], loc["path"])
                 if loc.get("upstream"):
@@ -984,6 +1069,7 @@ class App(tk.Tk):
             if not loc["is_git"]:
                 if not self.git(["git", "init", "-b", "main"], p)[0]:
                     return
+            self._untrack_caches(p)
             info = local_info(p, False)
             if info.get("changes") or info.get("no_commits"):
                 self.git(["git", "add", "-A"], p)

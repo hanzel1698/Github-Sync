@@ -19,6 +19,7 @@ It's meant for keeping several PCs (for example, a home laptop and a work deskto
 A local folder is matched to its GitHub repo through its git remote. So a folder named `Strut and Tie 2` is still matched correctly to `PileCapTruss`.
 
 * **Sync** runs a pull and then a push. If the same lines were changed on both PCs, it stops, changes nothing and tells you.
+* **Tool cache folders are never uploaded.** On Push, Sync and Publish the app stops tracking folders that tools rebuild on every PC (`.gradle`, `.kotlin`, `.cxx`, `.dart_tool`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.vs`, and a Gradle `build` folder next to `build.gradle`) and adds them to `.gitignore`. The files stay on this PC. When the other PC pulls this change, git deletes its copies of these folders, and the tools rebuild them on the next build. If a Sync conflict involves only such cache files, the app resolves it by itself.
 * **Pull all behind** and **Clone all missing** apply to every row at once.
 * To hide repos you don't want on this PC, right-click them and choose **Ignore on this PC**. Hidden repos appear under the **Show: Ignored** filter.
 * **File → Change projects folder…** points the app at a different folder. This setting is saved per PC in `%APPDATA%\GitHubSync\config.json`.
